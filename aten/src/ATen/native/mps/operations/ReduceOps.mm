@@ -312,6 +312,219 @@ static void norm_kernel_mps(TensorIterator& iter, const Scalar& p_scalar) {
   });
 }
 
+// ============================================================================
+// Metal kernel dispatch helpers for argreduce
+// ============================================================================
+
+static std::vector<int64_t> get_reduce_dims(const Tensor& input, OptionalIntArrayRef opt_dim) {
+  std::vector<int64_t> dims;
+  if (opt_dim.has_value() && !opt_dim.value().empty()) {
+    for (auto d : opt_dim.value()) {
+      dims.push_back(maybe_wrap_dim(d, input.dim()));
+    }
+  } else {
+    for (int64_t d = 0; d < input.dim(); d++) {
+      dims.push_back(d);
+    }
+  }
+  return dims;
+}
+
+static NormParams<> build_reduce_params(const Tensor& input,
+                                        const std::vector<int64_t>& reduce_dims,
+                                        const Tensor& output,
+                                        bool keepdim) {
+  NormParams params;
+  params.ndim = input.dim();
+  params.p = 0;
+  params.reduction_size = input.numel() / std::max<int64_t>(output.numel(), 1);
+
+  bool is_reduced[c10::metal::max_ndim] = {};
+  for (auto d : reduce_dims)
+    is_reduced[d] = true;
+
+  if (keepdim || output.dim() == input.dim()) {
+    for (uint32_t d = 0; d < params.ndim; d++) {
+      params.input_sizes[d] = input.size(d);
+      params.input_strides[d] = input.stride(d);
+      params.output_sizes[d] = output.size(d);
+      params.output_strides[d] = output.stride(d);
+    }
+  } else {
+    uint32_t out_d = 0;
+    for (uint32_t d = 0; d < params.ndim; d++) {
+      params.input_sizes[d] = input.size(d);
+      params.input_strides[d] = input.stride(d);
+      if (is_reduced[d]) {
+        params.output_sizes[d] = 1;
+        params.output_strides[d] = 0;
+      } else {
+        params.output_sizes[d] = output.size(out_d);
+        params.output_strides[d] = output.stride(out_d);
+        out_d++;
+      }
+    }
+  }
+
+  return params;
+}
+
+static void argreduce_kernel_mps(const Tensor& input,
+                                 const std::vector<int64_t>& reduce_dims,
+                                 bool keepdim,
+                                 bool is_max,
+                                 const Tensor& output_indices,
+                                 const Tensor* output_values = nullptr) {
+  if (output_indices.numel() == 0)
+    return;
+
+  auto in_str = scalarToMetalTypeString(input);
+  auto kernel_name = fmt::format("{}_{}", is_max ? "argmax" : "argmin", in_str);
+
+  uint32_t reduction_size = input.numel() / std::max<int64_t>(output_indices.numel(), 1);
+  auto params = build_reduce_params(input, reduce_dims, output_indices, keepdim);
+
+  uint8_t write_values = output_values ? 1 : 0;
+
+  Tensor values_placeholder;
+  const Tensor& values_tensor = output_values ? *output_values : (values_placeholder = at::empty({1}, input.options()));
+
+  // All-reduce fast path: a single threadgroup scanning the whole input does not
+  // parallelize across the GPU. Fused 2-pass (pass1 reduces contiguous chunks to
+  // per-group (index, value) in parallel; pass2 picks the winning group) — only
+  // two dispatches, beating both the single-TG kernel and a reshape/gather chain.
+  if (output_indices.numel() == 1 && input.is_contiguous() && input.numel() >= (1 << 14)) {
+    uint32_t total = static_cast<uint32_t>(input.numel());
+    // Finer chunks for small inputs (more parallel TGs); keep the large-input
+    // tuning (~8K elems/group) where memory throughput already saturates.
+    uint32_t floor_epg = (total < (1u << 18)) ? 1024u : (uint32_t)MAX_THREADGROUP_SIZE * 8u;
+    uint32_t num_groups = std::min(512u, c10::metal::ceil_div(total, floor_epg));
+    while (num_groups > 1 && total % num_groups != 0) {
+      num_groups--;
+    }
+    if (num_groups > 1) {
+      uint32_t epg = total / num_groups;
+      auto partials_val = at::empty({num_groups}, input.options());
+      auto partials_idx = at::empty({num_groups}, input.options().dtype(c10::kLong));
+      auto k1 = fmt::format("{}_pass1_{}", is_max ? "argmax" : "argmin", in_str);
+      auto k2 = fmt::format("{}_pass2_{}", is_max ? "argmax" : "argmin", in_str);
+      MPSStream* ar_stream = getCurrentMPSStream();
+      dispatch_sync_with_rethrow(ar_stream->queue(), ^() {
+        @autoreleasepool {
+          id<MTLComputeCommandEncoder> enc = ar_stream->commandEncoder();
+          auto ps1 = lib.getPipelineStateForFunc(k1);
+          getMPSProfiler().beginProfileKernel(ps1, is_max ? "argmax_pass1" : "argmin_pass1", {input});
+          [enc setComputePipelineState:ps1];
+          struct {
+            uint32_t epg, total;
+          } s1 = {epg, total};
+          mtl_setArgs(enc, input, partials_val, partials_idx, s1);
+          uint32_t tpg1 = std::min<uint32_t>(MAX_THREADGROUP_SIZE, epg);
+          [enc dispatchThreads:MTLSizeMake(num_groups * tpg1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg1, 1, 1)];
+          getMPSProfiler().endProfileKernel(ps1);
+
+          auto ps2 = lib.getPipelineStateForFunc(k2);
+          getMPSProfiler().beginProfileKernel(ps2, is_max ? "argmax_pass2" : "argmin_pass2", {input});
+          [enc setComputePipelineState:ps2];
+          uint32_t np = num_groups;
+          mtl_setArgs(enc, partials_val, partials_idx, output_indices, values_tensor, np, write_values);
+          uint32_t tpg2 = std::min<uint32_t>(MAX_THREADGROUP_SIZE, num_groups);
+          [enc dispatchThreads:MTLSizeMake(tpg2, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg2, 1, 1)];
+          getMPSProfiler().endProfileKernel(ps2);
+        }
+      });
+      return;
+    }
+  }
+
+  // Fast path: reducing the contiguous innermost dim with many rows. One SIMD
+  // group reduces one row, 8 rows per TG (mirrors sum/welford _inner) instead
+  // of one whole threadgroup per row, which over-subscribes the GPU and idles
+  // most threads for short rows.
+  bool is_inner = reduce_dims.size() == 1 && reduce_dims[0] == input.dim() - 1 && input.is_contiguous() &&
+      output_indices.is_contiguous();
+  uint32_t inner_N = is_inner ? (uint32_t)input.size(input.dim() - 1) : 0;
+  uint32_t inner_M = is_inner ? (uint32_t)(input.numel() / std::max<int64_t>(inner_N, 1)) : 0;
+  // The inner kernel assigns one SIMD group (32 lanes) per row, so it only wins
+  // when there are many rows to fill the GPU and each row is short enough for 32
+  // lanes. For few rows / huge rows (e.g. a 1D all-reduce: M=1, N=numel) a single
+  // SIMD group would serialize the whole reduction; fall through to the generic
+  // kernel, which spreads one row across a full threadgroup.
+  if (is_inner && inner_M >= 64 && inner_N <= 16384) {
+    uint32_t N = inner_N;
+    uint32_t M = inner_M;
+    auto inner_kernel = fmt::format("{}_inner_{}", is_max ? "argmax" : "argmin", in_str);
+    constexpr uint32_t TG = 256, rows_per_tg = TG / 32;
+    const uint32_t num_tgs = c10::metal::ceil_div(M, rows_per_tg);
+    MPSStream* inner_stream = getCurrentMPSStream();
+    dispatch_sync_with_rethrow(inner_stream->queue(), ^() {
+      @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = inner_stream->commandEncoder();
+        auto ps = lib.getPipelineStateForFunc(inner_kernel);
+        getMPSProfiler().beginProfileKernel(ps, is_max ? "argmax_inner" : "argmin_inner", {input});
+        [enc setComputePipelineState:ps];
+        struct {
+          uint32_t M, N;
+        } sizes_s = {M, N};
+        mtl_setArgs(enc, input, output_indices, values_tensor, sizes_s, write_values);
+        [enc dispatchThreads:MTLSizeMake(num_tgs * TG, 1, 1) threadsPerThreadgroup:MTLSizeMake(TG, 1, 1)];
+        getMPSProfiler().endProfileKernel(ps);
+      }
+    });
+    return;
+  }
+
+  // Fast path: reducing the outermost dim (dim 0) of a contiguous tensor. 2D TG
+  // (columns x row-workers) with coalesced reads + a per-column tree reduction,
+  // instead of one TG per output column with strided reads.
+  bool is_outer = reduce_dims.size() == 1 && reduce_dims[0] == 0 && input.dim() >= 2 && input.is_contiguous() &&
+      output_indices.is_contiguous();
+  if (is_outer) {
+    uint32_t M = input.size(0);
+    uint32_t N = input.numel() / M;
+    auto outer_kernel = fmt::format("{}_outer_{}", is_max ? "argmax" : "argmin", in_str);
+    constexpr uint32_t TG_X = 32, TG_Y = 32;
+    const uint32_t num_tg_x = c10::metal::ceil_div(N, TG_X);
+    MPSStream* outer_stream = getCurrentMPSStream();
+    dispatch_sync_with_rethrow(outer_stream->queue(), ^() {
+      @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = outer_stream->commandEncoder();
+        auto ps = lib.getPipelineStateForFunc(outer_kernel);
+        getMPSProfiler().beginProfileKernel(ps, is_max ? "argmax_outer" : "argmin_outer", {input});
+        [enc setComputePipelineState:ps];
+        struct {
+          uint32_t M, N;
+        } sizes_s = {M, N};
+        mtl_setArgs(enc, input, output_indices, values_tensor, sizes_s, write_values);
+        [enc dispatchThreads:MTLSizeMake(num_tg_x * TG_X, TG_Y, 1) threadsPerThreadgroup:MTLSizeMake(TG_X, TG_Y, 1)];
+        getMPSProfiler().endProfileKernel(ps);
+      }
+    });
+    return;
+  }
+
+  uint32_t threads_per_group;
+  if (reduction_size >= 512) {
+    threads_per_group = c10::metal::ceil_div(reduction_size / 16u, 32u) * 32u;
+    threads_per_group = std::clamp(threads_per_group, 32u, (uint32_t)MAX_THREADGROUP_SIZE);
+  } else {
+    threads_per_group = std::min(MAX_THREADGROUP_SIZE, c10::metal::ceil_div(reduction_size, 32u) * 32u);
+  }
+  uint32_t num_threads = output_indices.numel() * threads_per_group;
+
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> enc = stream->commandEncoder();
+      auto ps = lib.getPipelineStateForFunc(kernel_name);
+      getMPSProfiler().beginProfileKernel(ps, is_max ? "argmax" : "argmin", {input});
+      [enc setComputePipelineState:ps];
+      mtl_setArgs(enc, input, output_indices, values_tensor, params, write_values);
+      [enc dispatchThreads:MTLSizeMake(num_threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1, 1)];
+      getMPSProfiler().endProfileKernel(ps);
+    }
+  });
+}
 static Tensor std_var_common_impl_mps(const Tensor& input_t,
                                       at::OptionalIntArrayRef dim,
                                       const std::optional<Scalar>& correction,
@@ -561,8 +774,6 @@ static Tensor median_common_mps(const Tensor& input_t, bool nanmedian) {
 }
 
 static Tensor min_max_mps_impl(const Tensor& input_t, MPSReductionType reduction_type, const std::string& func_name) {
-  using CachedGraph = MPSUnaryCachedGraph;
-
   IntArrayRef input_shape = input_t.sizes();
   int64_t num_in_elements = c10::multiply_integers(input_shape);
 
@@ -572,35 +783,18 @@ static Tensor min_max_mps_impl(const Tensor& input_t, MPSReductionType reduction
     return output_t;
   }
 
-  @autoreleasepool {
-    std::string key = func_name + getTensorsStringKey(input_t);
-    CachedGraph* cachedGraph = LookUpOrCreateCachedGraph<CachedGraph>(key, [&](auto mpsGraph, auto newCachedGraph) {
-      MPSGraphTensor* inputTensor = mpsGraphRankedPlaceHolder(mpsGraph, input_t);
+  bool is_max = (reduction_type == MPSReductionType::MAX);
+  Tensor indices_placeholder = at::empty({}, ScalarType::Long, std::nullopt, kMPS, std::nullopt, std::nullopt);
+  auto reduce_dims = get_reduce_dims(input_t, std::nullopt);
 
-      MPSGraphTensor* castOutputTensor = nil;
-      MPSGraphTensor* castInputTensor = castToIHFTypes(mpsGraph, inputTensor, input_t);
-
-      NSArray<NSNumber*>* axes = getTensorAxes(input_t);
-      if (reduction_type == MPSReductionType::MAX) {
-        castOutputTensor = [mpsGraph reductionMaximumPropagateNaNWithTensor:castInputTensor axes:axes name:nil];
-      } else if (reduction_type == MPSReductionType::MIN) {
-        castOutputTensor = [mpsGraph reductionMinimumPropagateNaNWithTensor:castInputTensor axes:axes name:nil];
-      }
-
-      MPSGraphTensor* outputTensor = castOutputTensor;
-      if (getMPSDataType(output_t) != [castOutputTensor dataType]) {
-        outputTensor = castMPSTensor(mpsGraph, castOutputTensor, output_t.scalar_type());
-      }
-
-      newCachedGraph->inputTensor_ = inputTensor;
-      newCachedGraph->outputTensor_ = outputTensor;
-    });
-
-    auto inputPlaceholder = Placeholder(cachedGraph->inputTensor_, input_t);
-    auto outputPlaceholder = Placeholder(cachedGraph->outputTensor_, output_t, @[ @1 ]);
-
-    auto feeds = dictionaryFromPlaceholders(inputPlaceholder);
-    runMPSGraph(getCurrentMPSStream(), cachedGraph->graph(), feeds, outputPlaceholder);
+  Tensor input_for_kernel = input_t;
+  if (input_t.scalar_type() == kBool) {
+    input_for_kernel = input_t.to(kInt);
+    auto values_buf = at::empty({}, kInt, std::nullopt, kMPS, std::nullopt, std::nullopt);
+    argreduce_kernel_mps(input_for_kernel, reduce_dims, false, is_max, indices_placeholder, &values_buf);
+    output_t.copy_(values_buf.to(kBool));
+  } else {
+    argreduce_kernel_mps(input_for_kernel, reduce_dims, false, is_max, indices_placeholder, &output_t);
   }
 
   return output_t;
@@ -622,72 +816,18 @@ static void min_max_out_mps(const Tensor& input_t,
     return;
   }
 
-  // Derive from MPSCachedGraph
-  struct CachedGraph : public MPSCachedGraph {
-    CachedGraph(MPSGraph* graph) : MPSCachedGraph(graph) {}
-    MPSGraphTensor* inputTensor_ = nil;
-    MPSGraphTensor* outputTensor_ = nil;
-    MPSGraphTensor* indicesTensor_ = nil;
-  };
-
   int64_t dim_ = maybe_wrap_dim(dim, input_t.dim());
+  bool is_max = (reduction_type == MPSReductionType::MAX);
+  std::vector<int64_t> reduce_dims = {dim_};
 
-  // Calculate the output shape according to keepdim=True
-  // If there is no dim argument, the input shape is flattened
-  IntArrayRef input_shape = input_t.sizes();
-  int64_t num_input_dims = input_shape.size();
-  NSMutableArray<NSNumber*>* apparent_out_shape = nil;
-
-  apparent_out_shape = [NSMutableArray<NSNumber*> arrayWithCapacity:num_input_dims];
-  for (const auto i : c10::irange(num_input_dims)) {
-    apparent_out_shape[i] = dim_ == i ? @1 : [NSNumber numberWithInt:input_shape[i]];
-  }
-
-  auto stream = getCurrentMPSStream();
-
-  @autoreleasepool {
-    std::string key = func_name + getTensorsStringKey({input_t, indices_t}) + ":" + std::to_string(dim_);
-    auto cachedGraph = LookUpOrCreateCachedGraph<CachedGraph>(key, [&](auto mpsGraph, auto newCachedGraph) {
-      MPSGraphTensor* inputTensor = mpsGraphRankedPlaceHolder(mpsGraph, input_t);
-      MPSGraphTensor* outputTensor = nil;
-      MPSGraphTensor* castInputTensor = castToIHFTypes(mpsGraph, inputTensor, input_t);
-
-      if (reduction_type == MPSReductionType::MAX) {
-        outputTensor = [mpsGraph reductionMaximumPropagateNaNWithTensor:castInputTensor axis:(NSInteger)dim_ name:nil];
-      } else if (reduction_type == MPSReductionType::MIN) {
-        outputTensor = [mpsGraph reductionMinimumPropagateNaNWithTensor:castInputTensor axis:(NSInteger)dim_ name:nil];
-      }
-
-      MPSGraphTensor* argreduceOutTensor = nil;
-      if (reduction_type == MPSReductionType::MAX)
-        argreduceOutTensor = [mpsGraph reductionArgMaximumWithTensor:castInputTensor
-                                                                axis:(NSInteger)dim_
-                                                                name:@"argmax_out"];
-      else if (reduction_type == MPSReductionType::MIN)
-        argreduceOutTensor = [mpsGraph reductionArgMinimumWithTensor:castInputTensor
-                                                                axis:(NSInteger)dim_
-                                                                name:@"argmax_out"];
-
-      MPSGraphTensor* indicesTensor = nil;
-      if ([argreduceOutTensor dataType] != MPSDataTypeInt64) {
-        indicesTensor = [mpsGraph castTensor:argreduceOutTensor toType:MPSDataTypeInt64 name:@"cast_out"];
-      }
-
-      if ([outputTensor dataType] != getMPSDataType(output_t)) {
-        outputTensor = castMPSTensor(mpsGraph, outputTensor, output_t.scalar_type());
-      }
-      newCachedGraph->inputTensor_ = inputTensor;
-      newCachedGraph->outputTensor_ = outputTensor;
-      newCachedGraph->indicesTensor_ = indicesTensor;
-    });
-
-    auto inputPlaceholder = Placeholder(cachedGraph->inputTensor_, input_t);
-    auto outputPlaceholder = Placeholder(cachedGraph->outputTensor_, output_t, apparent_out_shape);
-    auto indicesPlaceholder = Placeholder(cachedGraph->indicesTensor_, indices_t, apparent_out_shape);
-
-    auto feeds = dictionaryFromPlaceholders(inputPlaceholder);
-    auto results = dictionaryFromPlaceholders(outputPlaceholder, indicesPlaceholder);
-    runMPSGraph(stream, cachedGraph->graph(), feeds, results);
+  Tensor input_for_kernel = input_t;
+  if (input_t.scalar_type() == kBool) {
+    input_for_kernel = input_t.to(kInt);
+    auto values_buf = at::empty(output_t.sizes(), kInt, std::nullopt, kMPS, std::nullopt, std::nullopt);
+    argreduce_kernel_mps(input_for_kernel, reduce_dims, keepdim, is_max, indices_t, &values_buf);
+    output_t.copy_(values_buf.to(kBool));
+  } else {
+    argreduce_kernel_mps(input_for_kernel, reduce_dims, keepdim, is_max, indices_t, &output_t);
   }
 }
 
@@ -754,92 +894,35 @@ static void argmax_argmin_out_mps(const Tensor& input_t,
                                   const Tensor& output_t,
                                   MPSReductionType reduction_type,
                                   const std::string& func_name) {
-  using CachedGraph = MPSUnaryCachedGraph;
-
-  int64_t dim_ = -1;
+  bool is_max = (reduction_type == MPSReductionType::MAX);
 
   if (dim.has_value()) {
-    dim_ = maybe_wrap_dim(dim.value(), input_t.dim());
-    zero_numel_check_dims(input_t, dim_, reduction_type == MPSReductionType::MAX ? "argmax()" : "argmin()");
+    int64_t dim_ = maybe_wrap_dim(dim.value(), input_t.dim());
+    zero_numel_check_dims(input_t, dim_, is_max ? "argmax()" : "argmin()");
   } else {
     TORCH_CHECK_INDEX(input_t.numel() != 0,
-                      reduction_type == MPSReductionType::MAX ? "argmax()" : "argmin()",
+                      is_max ? "argmax()" : "argmin()",
                       ": Expected reduction dim to be specified for input.numel() == 0.");
-    // Since input will be flattened, take argmax or argmin along 0'th dimension
-    dim_ = 0;
   }
 
-  // Calculate the output shape according to keepdim=True
-  // If there is no dim argument, the input shape is flattened
-  IntArrayRef input_shape = input_t.sizes();
-  int64_t num_input_dims = input_shape.size();
-  NSMutableArray<NSNumber*>* apparent_in_shape = nil;
-  NSMutableArray<NSNumber*>* apparent_out_shape = nil;
-
-  if (dim.has_value()) {
-    apparent_out_shape = [NSMutableArray<NSNumber*> arrayWithCapacity:num_input_dims];
-    for (const auto i : c10::irange(num_input_dims)) {
-      apparent_out_shape[i] = dim_ == i ? @1 : [NSNumber numberWithInt:input_shape[i]];
-    }
-  } else {
-    apparent_in_shape = [NSMutableArray<NSNumber*> arrayWithCapacity:1];
-    int64_t num_in_elements = c10::multiply_integers(input_shape);
-    apparent_in_shape[0] = [NSNumber numberWithInt:num_in_elements];
-
-    apparent_out_shape = [NSMutableArray<NSNumber*> arrayWithCapacity:1];
-    apparent_out_shape[0] = @1;
-  }
-
-  if (output_t.numel() == 0) {
+  if (output_t.numel() == 0)
     return;
+
+  std::vector<int64_t> reduce_dims;
+  if (dim.has_value()) {
+    reduce_dims.push_back(maybe_wrap_dim(dim.value(), input_t.dim()));
+  } else {
+    for (int64_t d = 0; d < input_t.dim(); d++)
+      reduce_dims.push_back(d);
   }
 
-  if (!apparent_in_shape) {
-    apparent_in_shape = [getMPSShape(input_t.sizes()) mutableCopy];
+  Tensor input_for_kernel = input_t;
+  if (input_t.scalar_type() == kBool) {
+    input_for_kernel = input_t.to(kInt);
   }
 
-  @autoreleasepool {
-    NSString* ns_key = [[apparent_in_shape valueForKey:@"description"] componentsJoinedByString:@","];
-    std::string key = func_name + ":" + std::to_string(dim_) + ":" + getTensorsStringKey(input_t) + ":" +
-        std::string([ns_key UTF8String]);
-    auto cachedGraph = LookUpOrCreateCachedGraph<CachedGraph>(key, [&](auto mpsGraph, auto newCachedGraph) {
-      auto inputScalarType = input_t.scalar_type();
-      MPSGraphTensor* inputTensor =
-          mpsGraphRankedPlaceHolder(mpsGraph, getMPSDataType(inputScalarType), apparent_in_shape);
-      MPSGraphTensor* argreduceOutTensor = nil;
-
-      MPSGraphTensor* castInputTensor = inputTensor;
-      if (inputScalarType != kInt && inputScalarType != kHalf && inputScalarType != kFloat &&
-          inputScalarType != kLong) {
-        castInputTensor = castMPSTensor(mpsGraph, inputTensor, kFloat);
-      }
-      if (reduction_type == MPSReductionType::MAX) {
-        argreduceOutTensor = [mpsGraph reductionArgMaximumWithTensor:castInputTensor axis:(NSInteger)dim_ name:nil];
-      } else {
-        argreduceOutTensor = [mpsGraph reductionArgMinimumWithTensor:castInputTensor axis:(NSInteger)dim_ name:nil];
-      }
-
-      MPSGraphTensor* outputTensor = argreduceOutTensor;
-      if (getMPSDataType(output_t) != [argreduceOutTensor dataType]) {
-        outputTensor = castMPSTensor(mpsGraph, argreduceOutTensor, output_t.scalar_type());
-      }
-
-      MPSGraphTensor* outputClampedTensor =
-          [mpsGraph clampWithTensor:outputTensor
-                     minValueTensor:[mpsGraph constantWithScalar:0 dataType:MPSDataTypeInt64]
-                     maxValueTensor:[mpsGraph constantWithScalar:0x7FEFFFFFFFFFFFFF dataType:MPSDataTypeInt64]
-                               name:nil];
-
-      newCachedGraph->inputTensor_ = inputTensor;
-      newCachedGraph->outputTensor_ = outputClampedTensor;
-    });
-
-    auto inputPlaceholder = Placeholder(cachedGraph->inputTensor_, input_t, apparent_in_shape);
-    auto outputPlaceholder = Placeholder(cachedGraph->outputTensor_, output_t, apparent_out_shape);
-
-    auto feeds = dictionaryFromPlaceholders(inputPlaceholder);
-    runMPSGraph(getCurrentMPSStream(), cachedGraph->graph(), feeds, outputPlaceholder);
-  }
+  // All-reduce is handled by the 2-pass inside argreduce_kernel_mps.
+  argreduce_kernel_mps(input_for_kernel, reduce_dims, keepdim, is_max, output_t);
 }
 
 // Unified host-side dispatch for value-preserving reductions on MPS, shared

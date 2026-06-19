@@ -196,16 +196,74 @@ inline ::c10::metal::pair<T, ushort> simd_argmax(T val) {
   return {rc, static_cast<ushort>(::metal::ctz(static_cast<ulong>(vote)))};
 }
 
-template <typename ARG_T, typename IDX_T>
+template <
+    typename ARG_T,
+    typename IDX_T,
+    ::metal::enable_if_t<::metal::is_integral_v<ARG_T>, bool> = true>
 inline c10::metal::pair<ARG_T, IDX_T> simd_argmin(ARG_T val, IDX_T idx_val) {
-  auto rc = simd_argmin(val);
-  return {rc.first, simd_broadcast(idx_val, rc.second)};
+  ARG_T min_val = simd_min(val);
+  ulong votes = static_cast<ulong>(::metal::simd_ballot(val == min_val));
+  IDX_T best =
+      simd_broadcast(idx_val, static_cast<ushort>(::metal::ctz(votes)));
+  for (votes &= (votes - 1); votes; votes &= (votes - 1)) {
+    IDX_T other =
+        simd_broadcast(idx_val, static_cast<ushort>(::metal::ctz(votes)));
+    best = (other < best) ? other : best;
+  }
+  return {min_val, best};
 }
 
-template <typename ARG_T, typename IDX_T>
+template <
+    typename ARG_T,
+    typename IDX_T,
+    ::metal::enable_if_t<::metal::is_floating_point_v<ARG_T>, bool> = true>
+inline c10::metal::pair<ARG_T, IDX_T> simd_argmin(ARG_T val, IDX_T idx_val) {
+  ARG_T min_val = simd_min(val);
+  bool matches = (val == min_val) || ::metal::isnan(val);
+  ulong votes = static_cast<ulong>(::metal::simd_ballot(matches));
+  IDX_T best =
+      simd_broadcast(idx_val, static_cast<ushort>(::metal::ctz(votes)));
+  for (votes &= (votes - 1); votes; votes &= (votes - 1)) {
+    IDX_T other =
+        simd_broadcast(idx_val, static_cast<ushort>(::metal::ctz(votes)));
+    best = (other < best) ? other : best;
+  }
+  return {min_val, best};
+}
+
+template <
+    typename ARG_T,
+    typename IDX_T,
+    ::metal::enable_if_t<::metal::is_integral_v<ARG_T>, bool> = true>
 inline c10::metal::pair<ARG_T, IDX_T> simd_argmax(ARG_T val, IDX_T idx_val) {
-  auto rc = simd_argmax(val);
-  return {rc.first, simd_broadcast(idx_val, rc.second)};
+  ARG_T max_val = simd_max(val);
+  ulong votes = static_cast<ulong>(::metal::simd_ballot(val == max_val));
+  IDX_T best =
+      simd_broadcast(idx_val, static_cast<ushort>(::metal::ctz(votes)));
+  for (votes &= (votes - 1); votes; votes &= (votes - 1)) {
+    IDX_T other =
+        simd_broadcast(idx_val, static_cast<ushort>(::metal::ctz(votes)));
+    best = (other < best) ? other : best;
+  }
+  return {max_val, best};
+}
+
+template <
+    typename ARG_T,
+    typename IDX_T,
+    ::metal::enable_if_t<::metal::is_floating_point_v<ARG_T>, bool> = true>
+inline c10::metal::pair<ARG_T, IDX_T> simd_argmax(ARG_T val, IDX_T idx_val) {
+  ARG_T max_val = simd_max(val);
+  bool matches = (val == max_val) || ::metal::isnan(val);
+  ulong votes = static_cast<ulong>(::metal::simd_ballot(matches));
+  IDX_T best =
+      simd_broadcast(idx_val, static_cast<ushort>(::metal::ctz(votes)));
+  for (votes &= (votes - 1); votes; votes &= (votes - 1)) {
+    IDX_T other =
+        simd_broadcast(idx_val, static_cast<ushort>(::metal::ctz(votes)));
+    best = (other < best) ? other : best;
+  }
+  return {max_val, best};
 }
 
 // Below algorithms are  written with hardcoded assumption that simdgroup is 32

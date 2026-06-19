@@ -1106,3 +1106,446 @@ REGISTER_REDUCTIONS_OPS_FOR_TYPE(uchar);
 REGISTER_PRED_REDUCTIONS_FOR_TYPE(bool);
 REGISTER_PRED_REDUCTIONS_FOR_TYPE(float2);
 REGISTER_PRED_REDUCTIONS_FOR_TYPE(half2);
+
+// ============================================================================
+// Arg-reduce kernels (argmax / argmin / max / min with indices)
+// ============================================================================
+
+template <typename TI, bool IS_MAX>
+kernel void argreduce(
+    constant TI* input [[buffer(0)]],
+    device long* output_indices [[buffer(1)]],
+    device TI* output_values [[buffer(2)]],
+    constant NormParams<>& params [[buffer(3)]],
+    constant uchar& write_values [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tptg [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]],
+    uint simdgroup_size_val [[threads_per_simdgroup]]) {
+  using TA = opmath_t<TI>;
+
+  TA best_val;
+  if (IS_MAX) {
+    best_val = ::metal::numeric_limits<TA>::lowest();
+  } else {
+    best_val = ::metal::numeric_limits<TA>::max();
+  }
+  long best_idx = 0;
+
+  uint32_t input_base = 0;
+  uint32_t reduction_stride = 1;
+  uint32_t num_reduced_dims = 0;
+  {
+    uint32_t out_idx = tgid;
+    for (int32_t dim = params.ndim - 1; dim >= 0; dim--) {
+      if (params.input_sizes[dim] != params.output_sizes[dim]) {
+        num_reduced_dims++;
+        reduction_stride = params.input_strides[dim];
+      } else {
+        auto idx = out_idx % params.output_sizes[dim];
+        out_idx /= params.output_sizes[dim];
+        input_base += idx * params.input_strides[dim];
+      }
+    }
+  }
+
+  const uint32_t rsize = params.reduction_size;
+
+  if (num_reduced_dims <= 1) {
+    for (uint32_t k = tid; k < rsize; k += tptg) {
+      TA val = static_cast<TA>(input[input_base + k * reduction_stride]);
+      bool better = IS_MAX ? (val > best_val) : (val < best_val);
+      if (better || ::metal::isnan(static_cast<float>(val))) {
+        best_val = val;
+        best_idx = k;
+      }
+    }
+  } else {
+    for (uint32_t k = tid; k < rsize; k += tptg) {
+      TA val = static_cast<TA>(input[get_input_offset(k, tgid, params)]);
+      bool better = IS_MAX ? (val > best_val) : (val < best_val);
+      if (better || ::metal::isnan(static_cast<float>(val))) {
+        best_val = val;
+        best_idx = k;
+      }
+    }
+  }
+
+  threadgroup TA arg_data[32];
+  threadgroup long idx_data[32];
+
+  long result_idx;
+  if (IS_MAX) {
+    result_idx = c10::metal::threadgroup_argmax(
+        arg_data, idx_data, best_val, best_idx, tid, tptg);
+  } else {
+    result_idx = c10::metal::threadgroup_argmin(
+        arg_data, idx_data, best_val, best_idx, tid, tptg);
+  }
+
+  if (tid == 0) {
+    uint32_t output_offset = 0;
+    uint32_t reduction_idx = tgid;
+    for (int32_t dim = params.ndim - 1; dim >= 0; dim--) {
+      auto output_dim_size = params.output_sizes[dim];
+      if (output_dim_size > 1) {
+        auto index_in_dim = reduction_idx % output_dim_size;
+        reduction_idx /= output_dim_size;
+        output_offset += index_in_dim * params.output_strides[dim];
+      }
+    }
+    output_indices[output_offset] = result_idx;
+    if (write_values) {
+      uint32_t val_input_offset;
+      if (num_reduced_dims <= 1) {
+        val_input_offset = input_base + result_idx * reduction_stride;
+      } else {
+        val_input_offset = get_input_offset(result_idx, tgid, params);
+      }
+      output_values[output_offset] = input[val_input_offset];
+    }
+  }
+}
+
+// Contiguous inner-dim arg-reduce: one SIMD group (32 lanes) reduces one row of
+// N elements; num_simd_groups rows share a threadgroup. Avoids launching one TG
+// per row (over-subscription + idle threads) for many short rows. Used when the
+// reduction is over the contiguous innermost dim. Same lowest-index/NaN tie
+// semantics as the generic kernel.
+template <typename TI, bool IS_MAX>
+kernel void argreduce_inner(
+    constant TI* input [[buffer(0)]],
+    device long* output_indices [[buffer(1)]],
+    device TI* output_values [[buffer(2)]],
+    constant uint2& sizes [[buffer(3)]], // [M, N]
+    constant uchar& write_values [[buffer(4)]],
+    uint tptg [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]]) {
+  using TA = opmath_t<TI>;
+  const uint M = sizes.x;
+  const uint N = sizes.y;
+  const uint num_simd_groups = tptg / 32;
+  uint row = tgid * num_simd_groups + simdgroup_id;
+  if (row >= M)
+    return;
+  constant TI* row_ptr = input + row * N;
+
+  TA best_val = IS_MAX ? ::metal::numeric_limits<TA>::lowest()
+                       : ::metal::numeric_limits<TA>::max();
+  long best_idx = 0;
+  for (uint k = simd_lane_id; k < N; k += 32) {
+    TA val = static_cast<TA>(row_ptr[k]);
+    bool better = IS_MAX ? (val > best_val) : (val < best_val);
+    if (better || ::metal::isnan(static_cast<float>(val))) {
+      best_val = val;
+      best_idx = k;
+    }
+  }
+  auto rc = IS_MAX ? c10::metal::simd_argmax(best_val, best_idx)
+                   : c10::metal::simd_argmin(best_val, best_idx);
+  if (simd_lane_id == 0) {
+    output_indices[row] = rc.second;
+    if (write_values) {
+      output_values[row] = static_cast<TI>(rc.first);
+    }
+  }
+}
+
+// Outer-dim arg-reduce (reduce dim 0 of a contiguous [M, N] tensor): TG_X
+// columns x TG_Y row-workers per threadgroup, coalesced column reads, then a
+// tree reduction across the TG_Y workers of each column. Avoids the generic
+// kernel's one-TG-per-output + strided reads for many output columns.
+template <typename TI, bool IS_MAX, uint TG_X, uint TG_Y>
+kernel void argreduce_outer(
+    constant TI* input [[buffer(0)]],
+    device long* output_indices [[buffer(1)]],
+    device TI* output_values [[buffer(2)]],
+    constant uint2& sizes [[buffer(3)]], // [M, N]
+    constant uchar& write_values [[buffer(4)]],
+    uint2 tid_tg [[thread_position_in_threadgroup]],
+    uint2 tg_pos [[threadgroup_position_in_grid]]) {
+  using TA = opmath_t<TI>;
+  const uint M = sizes.x;
+  const uint N = sizes.y;
+  uint col = tg_pos.x * TG_X + tid_tg.x;
+  if (col >= N)
+    return;
+
+  uint rows_per_y = (M + TG_Y - 1) / TG_Y;
+  uint row_start = tid_tg.y * rows_per_y;
+  uint row_end = ::metal::min(row_start + rows_per_y, M);
+
+  TA best_val = IS_MAX ? ::metal::numeric_limits<TA>::lowest()
+                       : ::metal::numeric_limits<TA>::max();
+  long best_idx = M; // sentinel: a worker with no rows never wins (idx >= M)
+  for (uint row = row_start; row < row_end; row++) {
+    TA val = static_cast<TA>(input[row * N + col]);
+    bool better = IS_MAX ? (val > best_val) : (val < best_val);
+    if (best_idx == (long)M || better ||
+        ::metal::isnan(static_cast<float>(val))) {
+      best_val = val;
+      best_idx = row;
+    }
+  }
+
+  threadgroup TA vmem[TG_Y][TG_X];
+  threadgroup long imem[TG_Y][TG_X];
+  vmem[tid_tg.y][tid_tg.x] = best_val;
+  imem[tid_tg.y][tid_tg.x] = best_idx;
+  ::metal::threadgroup_barrier(::metal::mem_flags::mem_threadgroup);
+
+  for (uint s = TG_Y / 2; s > 0; s >>= 1) {
+    if (tid_tg.y < s) {
+      TA cv = vmem[tid_tg.y][tid_tg.x];
+      long ci = imem[tid_tg.y][tid_tg.x];
+      TA ov = vmem[tid_tg.y + s][tid_tg.x];
+      long oi = imem[tid_tg.y + s][tid_tg.x];
+      bool c_valid = ci < (long)M, o_valid = oi < (long)M;
+      bool c_nan = c_valid && ::metal::isnan(static_cast<float>(cv));
+      bool o_nan = o_valid && ::metal::isnan(static_cast<float>(ov));
+      bool take;
+      if (!o_valid) {
+        take = false;
+      } else if (!c_valid) {
+        take = true;
+      } else if (o_nan != c_nan) {
+        take = o_nan; // NaN beats non-NaN (torch returns a NaN index)
+      } else if (o_nan && c_nan) {
+        take = oi < ci; // both NaN: lowest index
+      } else {
+        bool better = IS_MAX ? (ov > cv) : (ov < cv);
+        take = better || (ov == cv && oi < ci); // tie -> lowest index
+      }
+      if (take) {
+        vmem[tid_tg.y][tid_tg.x] = ov;
+        imem[tid_tg.y][tid_tg.x] = oi;
+      }
+    }
+    ::metal::threadgroup_barrier(::metal::mem_flags::mem_threadgroup);
+  }
+
+  if (tid_tg.y == 0) {
+    output_indices[col] = imem[0][tid_tg.x];
+    if (write_values) {
+      output_values[col] = static_cast<TI>(vmem[0][tid_tg.x]);
+    }
+  }
+}
+
+// Fused 2-pass arg-reduce for large all-reduce (value+index). pass1: each TG
+// reduces a contiguous chunk to a per-group (winning global index, value);
+// pass2: a single TG picks the winning group. Only 2 dispatches (vs the
+// reshape/gather/index_select chain), which matters at ~1M elems where the
+// generic single-TG kernel is dispatch/parallelism-bound. Lowest index wins
+// ties.
+template <typename TI, bool IS_MAX>
+kernel void argreduce_pass1(
+    constant TI* input [[buffer(0)]],
+    device TI* partials_val [[buffer(1)]],
+    device long* partials_idx [[buffer(2)]],
+    constant uint2& sizes [[buffer(3)]], // [elems_per_group, total_N]
+    uint tid [[thread_position_in_threadgroup]],
+    uint tptg [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]]) {
+  using TA = opmath_t<TI>;
+  const uint epg = sizes.x;
+  const uint total_N = sizes.y;
+  const uint group_start = tgid * epg;
+  const uint group_end = min(group_start + epg, total_N);
+
+  TA best_val = IS_MAX ? ::metal::numeric_limits<TA>::lowest()
+                       : ::metal::numeric_limits<TA>::max();
+  long best_idx = group_start;
+  for (uint k = group_start + tid; k < group_end; k += tptg) {
+    TA val = static_cast<TA>(input[k]);
+    bool better = IS_MAX ? (val > best_val) : (val < best_val);
+    if (better || ::metal::isnan(static_cast<float>(val))) {
+      best_val = val;
+      best_idx = k;
+    }
+  }
+  threadgroup TA arg_data[32];
+  threadgroup long idx_data[32];
+  long win = IS_MAX ? c10::metal::threadgroup_argmax(
+                          arg_data, idx_data, best_val, best_idx, tid, tptg)
+                    : c10::metal::threadgroup_argmin(
+                          arg_data, idx_data, best_val, best_idx, tid, tptg);
+  if (tid == 0) {
+    partials_idx[tgid] = win;
+    partials_val[tgid] = input[win];
+  }
+}
+
+template <typename TI, bool IS_MAX>
+kernel void argreduce_pass2(
+    device const TI* partials_val [[buffer(0)]],
+    device const long* partials_idx [[buffer(1)]],
+    device long* output_idx [[buffer(2)]],
+    device TI* output_val [[buffer(3)]],
+    constant uint& num_partials [[buffer(4)]],
+    constant uchar& write_values [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tptg [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]]) {
+  using TA = opmath_t<TI>;
+  TA best_val = IS_MAX ? ::metal::numeric_limits<TA>::lowest()
+                       : ::metal::numeric_limits<TA>::max();
+  long best_pos = 0;
+  for (uint i = tid; i < num_partials; i += tptg) {
+    TA val = static_cast<TA>(partials_val[i]);
+    bool better = IS_MAX ? (val > best_val) : (val < best_val);
+    if (better || ::metal::isnan(static_cast<float>(val))) {
+      best_val = val;
+      best_pos = (long)i;
+    }
+  }
+  threadgroup TA arg_data[32];
+  threadgroup long idx_data[32];
+  long win_pos = IS_MAX
+      ? c10::metal::threadgroup_argmax(
+            arg_data, idx_data, best_val, best_pos, tid, tptg)
+      : c10::metal::threadgroup_argmin(
+            arg_data, idx_data, best_val, best_pos, tid, tptg);
+  if (tid == 0) {
+    output_idx[0] = partials_idx[win_pos];
+    if (write_values) {
+      output_val[0] = partials_val[win_pos];
+    }
+  }
+}
+
+#define REGISTER_ARGREDUCE(TI, NAME, IS_MAX)                \
+  template [[host_name(NAME "_" #TI)]]                      \
+  kernel void argreduce<TI, IS_MAX>(                        \
+      constant TI * input [[buffer(0)]],                    \
+      device long* output_indices [[buffer(1)]],            \
+      device TI* output_values [[buffer(2)]],               \
+      constant NormParams<>& params [[buffer(3)]],          \
+      constant uchar& write_values [[buffer(4)]],           \
+      uint tid [[thread_position_in_threadgroup]],          \
+      uint tptg [[threads_per_threadgroup]],                \
+      uint tgid [[threadgroup_position_in_grid]],           \
+      uint simd_lane_id [[thread_index_in_simdgroup]],      \
+      uint simdgroup_id [[simdgroup_index_in_threadgroup]], \
+      uint simdgroup_size_val [[threads_per_simdgroup]]);
+
+REGISTER_ARGREDUCE(float, "argmax", true);
+REGISTER_ARGREDUCE(float, "argmin", false);
+REGISTER_ARGREDUCE(half, "argmax", true);
+REGISTER_ARGREDUCE(half, "argmin", false);
+REGISTER_ARGREDUCE(bfloat, "argmax", true);
+REGISTER_ARGREDUCE(bfloat, "argmin", false);
+REGISTER_ARGREDUCE(int, "argmax", true);
+REGISTER_ARGREDUCE(int, "argmin", false);
+REGISTER_ARGREDUCE(long, "argmax", true);
+REGISTER_ARGREDUCE(long, "argmin", false);
+REGISTER_ARGREDUCE(short, "argmax", true);
+REGISTER_ARGREDUCE(short, "argmin", false);
+REGISTER_ARGREDUCE(char, "argmax", true);
+REGISTER_ARGREDUCE(char, "argmin", false);
+REGISTER_ARGREDUCE(uchar, "argmax", true);
+REGISTER_ARGREDUCE(uchar, "argmin", false);
+
+#define REGISTER_ARGREDUCE_INNER(TI, NAME, IS_MAX)     \
+  template [[host_name(NAME "_inner_" #TI)]]           \
+  kernel void argreduce_inner<TI, IS_MAX>(             \
+      constant TI * input [[buffer(0)]],               \
+      device long* output_indices [[buffer(1)]],       \
+      device TI* output_values [[buffer(2)]],          \
+      constant uint2& sizes [[buffer(3)]],             \
+      constant uchar& write_values [[buffer(4)]],      \
+      uint tptg [[threads_per_threadgroup]],           \
+      uint tgid [[threadgroup_position_in_grid]],      \
+      uint simd_lane_id [[thread_index_in_simdgroup]], \
+      uint simdgroup_id [[simdgroup_index_in_threadgroup]]);
+REGISTER_ARGREDUCE_INNER(float, "argmax", true);
+REGISTER_ARGREDUCE_INNER(float, "argmin", false);
+REGISTER_ARGREDUCE_INNER(half, "argmax", true);
+REGISTER_ARGREDUCE_INNER(half, "argmin", false);
+REGISTER_ARGREDUCE_INNER(bfloat, "argmax", true);
+REGISTER_ARGREDUCE_INNER(bfloat, "argmin", false);
+REGISTER_ARGREDUCE_INNER(int, "argmax", true);
+REGISTER_ARGREDUCE_INNER(int, "argmin", false);
+REGISTER_ARGREDUCE_INNER(long, "argmax", true);
+REGISTER_ARGREDUCE_INNER(long, "argmin", false);
+REGISTER_ARGREDUCE_INNER(short, "argmax", true);
+REGISTER_ARGREDUCE_INNER(short, "argmin", false);
+REGISTER_ARGREDUCE_INNER(char, "argmax", true);
+REGISTER_ARGREDUCE_INNER(char, "argmin", false);
+REGISTER_ARGREDUCE_INNER(uchar, "argmax", true);
+REGISTER_ARGREDUCE_INNER(uchar, "argmin", false);
+
+#define REGISTER_ARGREDUCE_OUTER(TI, NAME, IS_MAX)     \
+  template [[host_name(NAME "_outer_" #TI)]]           \
+  kernel void argreduce_outer<TI, IS_MAX, 32, 32>(     \
+      constant TI * input [[buffer(0)]],               \
+      device long* output_indices [[buffer(1)]],       \
+      device TI* output_values [[buffer(2)]],          \
+      constant uint2& sizes [[buffer(3)]],             \
+      constant uchar& write_values [[buffer(4)]],      \
+      uint2 tid_tg [[thread_position_in_threadgroup]], \
+      uint2 tg_pos [[threadgroup_position_in_grid]]);
+REGISTER_ARGREDUCE_OUTER(float, "argmax", true);
+REGISTER_ARGREDUCE_OUTER(float, "argmin", false);
+REGISTER_ARGREDUCE_OUTER(half, "argmax", true);
+REGISTER_ARGREDUCE_OUTER(half, "argmin", false);
+REGISTER_ARGREDUCE_OUTER(bfloat, "argmax", true);
+REGISTER_ARGREDUCE_OUTER(bfloat, "argmin", false);
+REGISTER_ARGREDUCE_OUTER(int, "argmax", true);
+REGISTER_ARGREDUCE_OUTER(int, "argmin", false);
+REGISTER_ARGREDUCE_OUTER(long, "argmax", true);
+REGISTER_ARGREDUCE_OUTER(long, "argmin", false);
+REGISTER_ARGREDUCE_OUTER(short, "argmax", true);
+REGISTER_ARGREDUCE_OUTER(short, "argmin", false);
+REGISTER_ARGREDUCE_OUTER(char, "argmax", true);
+REGISTER_ARGREDUCE_OUTER(char, "argmin", false);
+REGISTER_ARGREDUCE_OUTER(uchar, "argmax", true);
+REGISTER_ARGREDUCE_OUTER(uchar, "argmin", false);
+
+#define REGISTER_ARGREDUCE_2PASS(TI, NAME, IS_MAX)           \
+  template [[host_name(NAME "_pass1_" #TI)]]                 \
+  kernel void argreduce_pass1<TI, IS_MAX>(                   \
+      constant TI * input [[buffer(0)]],                     \
+      device TI * partials_val [[buffer(1)]],                \
+      device long* partials_idx [[buffer(2)]],               \
+      constant uint2& sizes [[buffer(3)]],                   \
+      uint tid [[thread_position_in_threadgroup]],           \
+      uint tptg [[threads_per_threadgroup]],                 \
+      uint tgid [[threadgroup_position_in_grid]],            \
+      uint simd_lane_id [[thread_index_in_simdgroup]],       \
+      uint simdgroup_id [[simdgroup_index_in_threadgroup]]); \
+  template [[host_name(NAME "_pass2_" #TI)]]                 \
+  kernel void argreduce_pass2<TI, IS_MAX>(                   \
+      device const TI* partials_val [[buffer(0)]],           \
+      device const long* partials_idx [[buffer(1)]],         \
+      device long* output_idx [[buffer(2)]],                 \
+      device TI* output_val [[buffer(3)]],                   \
+      constant uint& num_partials [[buffer(4)]],             \
+      constant uchar& write_values [[buffer(5)]],            \
+      uint tid [[thread_position_in_threadgroup]],           \
+      uint tptg [[threads_per_threadgroup]],                 \
+      uint simd_lane_id [[thread_index_in_simdgroup]],       \
+      uint simdgroup_id [[simdgroup_index_in_threadgroup]]);
+REGISTER_ARGREDUCE_2PASS(float, "argmax", true);
+REGISTER_ARGREDUCE_2PASS(float, "argmin", false);
+REGISTER_ARGREDUCE_2PASS(half, "argmax", true);
+REGISTER_ARGREDUCE_2PASS(half, "argmin", false);
+REGISTER_ARGREDUCE_2PASS(bfloat, "argmax", true);
+REGISTER_ARGREDUCE_2PASS(bfloat, "argmin", false);
+REGISTER_ARGREDUCE_2PASS(int, "argmax", true);
+REGISTER_ARGREDUCE_2PASS(int, "argmin", false);
+REGISTER_ARGREDUCE_2PASS(long, "argmax", true);
+REGISTER_ARGREDUCE_2PASS(long, "argmin", false);
+REGISTER_ARGREDUCE_2PASS(short, "argmax", true);
+REGISTER_ARGREDUCE_2PASS(short, "argmin", false);
+REGISTER_ARGREDUCE_2PASS(char, "argmax", true);
+REGISTER_ARGREDUCE_2PASS(char, "argmin", false);
+REGISTER_ARGREDUCE_2PASS(uchar, "argmax", true);
+REGISTER_ARGREDUCE_2PASS(uchar, "argmin", false);

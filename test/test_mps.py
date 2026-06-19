@@ -15328,6 +15328,94 @@ class TestMetalLibrary(TestCaseMPS):
 # This requires mps to be properly registered in the device generic test framework which is not the
 # case right now. We can probably use `allow_mps` introduced in https://github.com/pytorch/pytorch/pull/87342
 # to achieve this.
+
+class TestReduceOpsMetal(TestCaseMPS):
+    """Tests for Metal kernel reduce ops: argmax/argmin, max/min."""
+
+    # =========================================================================
+    # Argmax / Argmin
+    # =========================================================================
+    def test_argmax_metal_basic(self):
+        for shape in [(8,), (4, 8), (2, 4, 8)]:
+            for dtype in [torch.float32, torch.int32, torch.int64, torch.float16]:
+                if dtype in [torch.float32, torch.float16]:
+                    cpu_x = torch.randn(shape, device='cpu', dtype=dtype)
+                else:
+                    n = 1
+                    for s in shape:
+                        n *= s
+                    cpu_x = torch.randperm(n, device='cpu', dtype=dtype).reshape(shape)
+                mps_x = cpu_x.to('mps')
+                # No dim
+                self.assertEqual(torch.argmax(mps_x), torch.argmax(cpu_x))
+                self.assertEqual(torch.argmin(mps_x), torch.argmin(cpu_x))
+                # Per dim
+                for dim in range(len(shape)):
+                    self.assertEqual(torch.argmax(mps_x, dim=dim), torch.argmax(cpu_x, dim=dim))
+                    self.assertEqual(torch.argmin(mps_x, dim=dim), torch.argmin(cpu_x, dim=dim))
+                    self.assertEqual(
+                        torch.argmax(mps_x, dim=dim, keepdim=True),
+                        torch.argmax(cpu_x, dim=dim, keepdim=True))
+
+    def test_argmax_metal_large(self):
+        cpu_x = torch.randn(256, 512, device='cpu')
+        mps_x = cpu_x.to('mps')
+        self.assertEqual(torch.argmax(mps_x, dim=0), torch.argmax(cpu_x, dim=0))
+        self.assertEqual(torch.argmax(mps_x, dim=1), torch.argmax(cpu_x, dim=1))
+        self.assertEqual(torch.argmin(mps_x, dim=0), torch.argmin(cpu_x, dim=0))
+        self.assertEqual(torch.argmin(mps_x, dim=1), torch.argmin(cpu_x, dim=1))
+
+    # =========================================================================
+    # Max / Min with dim (values + indices)
+    # =========================================================================
+    def test_max_dim_metal(self):
+        for shape in [(8,), (4, 8), (2, 4, 8)]:
+            for dtype in [torch.float32, torch.int32, torch.float16]:
+                if dtype == torch.float32 or dtype == torch.float16:
+                    cpu_x = torch.randn(shape, device='cpu', dtype=dtype)
+                else:
+                    cpu_x = torch.randint(-10, 10, shape, device='cpu', dtype=dtype)
+                mps_x = cpu_x.to('mps')
+                for dim in range(len(shape)):
+                    mv, mi = torch.max(mps_x, dim=dim)
+                    cv, ci = torch.max(cpu_x, dim=dim)
+                    self.assertEqual(mv, cv)
+                    self.assertEqual(mi, ci)
+                    mv, mi = torch.max(mps_x, dim=dim, keepdim=True)
+                    cv, ci = torch.max(cpu_x, dim=dim, keepdim=True)
+                    self.assertEqual(mv, cv)
+                    self.assertEqual(mi, ci)
+
+    def test_min_dim_metal(self):
+        cpu_x = torch.randn(4, 8, device='cpu')
+        mps_x = cpu_x.to('mps')
+        for dim in [0, 1]:
+            mv, mi = torch.min(mps_x, dim=dim)
+            cv, ci = torch.min(cpu_x, dim=dim)
+            self.assertEqual(mv, cv)
+            self.assertEqual(mi, ci)
+
+    def test_max_scalar_metal(self):
+        cpu_x = torch.randn(64, device='cpu')
+        mps_x = cpu_x.to('mps')
+        self.assertEqual(torch.max(mps_x), torch.max(cpu_x))
+        self.assertEqual(torch.min(mps_x), torch.min(cpu_x))
+
+    def test_max_min_metal_large(self):
+        cpu_x = torch.randn(128, 256, device='cpu')
+        mps_x = cpu_x.to('mps')
+        mv, mi = torch.max(mps_x, dim=0)
+        cv, ci = torch.max(cpu_x, dim=0)
+        self.assertEqual(mv, cv)
+        self.assertEqual(mi, ci)
+        mv, mi = torch.max(mps_x, dim=1)
+        cv, ci = torch.max(cpu_x, dim=1)
+        self.assertEqual(mv, cv)
+        self.assertEqual(mi, ci)
+
+
+instantiate_parametrized_tests(TestReduceOpsMetal)
+
 instantiate_device_type_tests(TestConsistency, globals(), allow_mps=True, only_for="mps")
 instantiate_device_type_tests(TestErrorInputs, globals(), allow_mps=True, only_for="mps")
 instantiate_device_type_tests(TestCommon, globals(), allow_mps=True, only_for="mps")
